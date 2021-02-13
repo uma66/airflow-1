@@ -28,6 +28,8 @@ from airflow.providers.google.cloud.hooks.cloud_storage_transfer_service import 
     ACCESS_KEY_ID,
     AWS_ACCESS_KEY,
     AWS_S3_DATA_SOURCE,
+    AZURE_BLOB_STORAGE_DATA_SOURCE,
+    AZURE_CREDENTIALS,
     BUCKET_NAME,
     DAY,
     DESCRIPTION,
@@ -40,6 +42,7 @@ from airflow.providers.google.cloud.hooks.cloud_storage_transfer_service import 
     NAME,
     OBJECT_CONDITIONS,
     PROJECT_ID,
+    SAS_TOKEN,
     SCHEDULE,
     SCHEDULE_END_DATE,
     SCHEDULE_START_DATE,
@@ -53,15 +56,23 @@ from airflow.providers.google.cloud.hooks.cloud_storage_transfer_service import 
     CloudDataTransferServiceHook,
     GcpTransferJobsStatus,
 )
+from airflow.providers.microsoft.azure.hooks.wasb import WasbHook
 from airflow.utils.decorators import apply_defaults
 
 
 class TransferJobPreprocessor:
     """Helper class for preprocess of transfer job body."""
 
-    def __init__(self, body: dict, aws_conn_id: str = 'aws_default', default_schedule: bool = False) -> None:
+    def __init__(
+        self,
+        body: dict,
+        aws_conn_id: str = 'aws_default',
+        wasb_conn_id: str = 'wasb_default',
+        default_schedule: bool = False,
+    ) -> None:
         self.body = body
         self.aws_conn_id = aws_conn_id
+        self.wasb_conn_id = wasb_conn_id
         self.default_schedule = default_schedule
 
     def _inject_aws_credentials(self) -> None:
@@ -73,6 +84,13 @@ class TransferJobPreprocessor:
             self.body[TRANSFER_SPEC][AWS_S3_DATA_SOURCE][AWS_ACCESS_KEY] = {
                 ACCESS_KEY_ID: aws_access_key_id,
                 SECRET_ACCESS_KEY: aws_secret_access_key,
+            }
+
+    def _inject_azure_credentials(self) -> None:
+        if TRANSFER_SPEC in self.body and AZURE_BLOB_STORAGE_DATA_SOURCE in self.body[TRANSFER_SPEC]:
+            wasb_hook = WasbHook(self.wasb_conn_id)
+            self.body[TRANSFER_SPEC][AZURE_BLOB_STORAGE_DATA_SOURCE][AZURE_CREDENTIALS] = {
+                SAS_TOKEN: wasb_hook.get_sas_token()
             }
 
     def _reformat_date(self, field_key: str) -> None:
@@ -101,13 +119,14 @@ class TransferJobPreprocessor:
 
     def process_body(self) -> dict:
         """
-        Injects AWS credentials into body if needed and
+        Injects AWS or Azure credentials into body if needed and
         reformats schedule information.
 
         :return: Preprocessed body
         :rtype: dict
         """
         self._inject_aws_credentials()
+        self._inject_azure_credentials()
         self._reformat_schedule()
         return self.body
 
@@ -134,13 +153,14 @@ class TransferJobValidator:
     def _verify_data_source(self) -> None:
         is_gcs = GCS_DATA_SOURCE in self.body[TRANSFER_SPEC]
         is_aws_s3 = AWS_S3_DATA_SOURCE in self.body[TRANSFER_SPEC]
+        is_azure_wasb = AZURE_BLOB_STORAGE_DATA_SOURCE in self.body[TRANSFER_SPEC]
         is_http = HTTP_DATA_SOURCE in self.body[TRANSFER_SPEC]
 
-        sources_count = sum([is_gcs, is_aws_s3, is_http])
+        sources_count = sum([is_gcs, is_aws_s3, is_azure_wasb, is_http])
         if sources_count > 1:
             raise AirflowException(
                 "More than one data source detected. Please choose exactly one data source from: "
-                "gcsDataSource, awsS3DataSource and httpDataSource."
+                "gcsDataSource, awsS3DataSource, azureBlobStorageDataSource and httpDataSource."
             )
 
     def _restrict_aws_credentials(self) -> None:
@@ -151,16 +171,25 @@ class TransferJobValidator:
                 "please use Airflow connections to store credentials."
             )
 
+    def _restrict_azure_credentials(self) -> None:
+        azure_transfer = AZURE_BLOB_STORAGE_DATA_SOURCE in self.body[TRANSFER_SPEC]
+        if azure_transfer and AZURE_CREDENTIALS in self.body[TRANSFER_SPEC][AZURE_BLOB_STORAGE_DATA_SOURCE]:
+            raise AirflowException(
+                "Azure credentials detected inside the body parameter (azureCredentials)."
+                "This is not allowed, please use Airflow connections to store credentials."
+            )
+
     def validate_body(self) -> None:
         """
         Validates the body. Checks if body specifies `transferSpec`
-        if yes, then check if AWS credentials are passed correctly and
+        if yes, then check if AWS or Azure credentials are passed correctly and
         no more than 1 data source was selected.
 
         :raises: AirflowException
         """
         if TRANSFER_SPEC in self.body:
             self._restrict_aws_credentials()
+            self._restrict_azure_credentials()
             self._verify_data_source()
 
 
@@ -188,13 +217,16 @@ class CloudDataTransferServiceCreateJobOperator(BaseOperator):
 
         * dates can be given in the form :class:`datetime.date`
         * times can be given in the form :class:`datetime.time`
-        * credentials to Amazon Web Service should be stored in the connection and indicated by the
-          aws_conn_id parameter
+        * credentials to Amazon Web Service or Microsoft Azure should be stored in the connection
+          and indicated. The conn_id to be set is aws_conn_id for Amazon Web Service
+          and wasb_conn_id for Microsoft Azure.
 
     :type body: dict
     :param aws_conn_id: The connection ID used to retrieve credentials to
         Amazon Web Service.
     :type aws_conn_id: str
+    :param wasb_conn_id: The connection ID used to reference to the wasb connection.
+    :type wasb_conn_id: str
     :param gcp_conn_id: The connection ID used to connect to Google Cloud.
     :type gcp_conn_id: str
     :param api_version: API version used (e.g. v1).
@@ -215,6 +247,7 @@ class CloudDataTransferServiceCreateJobOperator(BaseOperator):
         'body',
         'gcp_conn_id',
         'aws_conn_id',
+        'wasb_conn_id',
         'google_impersonation_chain',
     )
     # [END gcp_transfer_job_create_template_fields]
@@ -225,6 +258,7 @@ class CloudDataTransferServiceCreateJobOperator(BaseOperator):
         *,
         body: dict,
         aws_conn_id: str = 'aws_default',
+        wasb_conn_id: str = 'wasb_default',
         gcp_conn_id: str = 'google_cloud_default',
         api_version: str = 'v1',
         google_impersonation_chain: Optional[Union[str, Sequence[str]]] = None,
@@ -233,6 +267,7 @@ class CloudDataTransferServiceCreateJobOperator(BaseOperator):
         super().__init__(**kwargs)
         self.body = deepcopy(body)
         self.aws_conn_id = aws_conn_id
+        self.wasb_conn_id = wasb_conn_id
         self.gcp_conn_id = gcp_conn_id
         self.api_version = api_version
         self.google_impersonation_chain = google_impersonation_chain
@@ -242,7 +277,11 @@ class CloudDataTransferServiceCreateJobOperator(BaseOperator):
         TransferJobValidator(body=self.body).validate_body()
 
     def execute(self, context) -> dict:
-        TransferJobPreprocessor(body=self.body, aws_conn_id=self.aws_conn_id).process_body()
+        TransferJobPreprocessor(
+            body=self.body,
+            aws_conn_id=self.aws_conn_id,
+            wasb_conn_id=self.wasb_conn_id,
+        ).process_body()
         hook = CloudDataTransferServiceHook(
             api_version=self.api_version,
             gcp_conn_id=self.gcp_conn_id,
@@ -267,13 +306,16 @@ class CloudDataTransferServiceUpdateJobOperator(BaseOperator):
 
         * dates can be given in the form :class:`datetime.date`
         * times can be given in the form :class:`datetime.time`
-        * credentials to Amazon Web Service should be stored in the connection and indicated by the
-          aws_conn_id parameter
+        * credentials to Amazon Web Service or Microsoft Azure should be stored in the connection
+          and indicated. The conn_id to be set is aws_conn_id for Amazon Web Service
+          and wasb_conn_id for Microsoft Azure.
 
     :type body: dict
     :param aws_conn_id: The connection ID used to retrieve credentials to
         Amazon Web Service.
     :type aws_conn_id: str
+    :param wasb_conn_id: The connection ID used to reference to the wasb connection.
+    :type wasb_conn_id: str
     :param gcp_conn_id: The connection ID used to connect to Google Cloud.
     :type gcp_conn_id: str
     :param api_version: API version used (e.g. v1).
@@ -294,6 +336,7 @@ class CloudDataTransferServiceUpdateJobOperator(BaseOperator):
         'job_name',
         'body',
         'gcp_conn_id',
+        'wasb_conn_id',
         'aws_conn_id',
         'google_impersonation_chain',
     )
@@ -306,6 +349,7 @@ class CloudDataTransferServiceUpdateJobOperator(BaseOperator):
         job_name: str,
         body: dict,
         aws_conn_id: str = 'aws_default',
+        wasb_conn_id: str = 'wasb_default',
         gcp_conn_id: str = 'google_cloud_default',
         api_version: str = 'v1',
         google_impersonation_chain: Optional[Union[str, Sequence[str]]] = None,
@@ -317,6 +361,7 @@ class CloudDataTransferServiceUpdateJobOperator(BaseOperator):
         self.gcp_conn_id = gcp_conn_id
         self.api_version = api_version
         self.aws_conn_id = aws_conn_id
+        self.wasb_conn_id = wasb_conn_id
         self.google_impersonation_chain = google_impersonation_chain
         self._validate_inputs()
 
@@ -326,7 +371,11 @@ class CloudDataTransferServiceUpdateJobOperator(BaseOperator):
             raise AirflowException("The required parameter 'job_name' is empty or None")
 
     def execute(self, context) -> dict:
-        TransferJobPreprocessor(body=self.body, aws_conn_id=self.aws_conn_id).process_body()
+        TransferJobPreprocessor(
+            body=self.body,
+            aws_conn_id=self.aws_conn_id,
+            wasb_conn_id=self.wasb_conn_id,
+        ).process_body()
         hook = CloudDataTransferServiceHook(
             api_version=self.api_version,
             gcp_conn_id=self.gcp_conn_id,

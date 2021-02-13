@@ -52,8 +52,11 @@ The function accepts time in two formats:
 
 - as an :class:`~datetime.time` object
 
-If you want to create a job transfer that copies data from AWS S3 then you must have a connection configured. Information about configuration for AWS is available: :doc:`apache-airflow-providers-amazon:connections/aws`
+If you want to create a job transfer that copies data from AWS S3 or Azure Blob Storage then you must have a connection configured.
+Information about configuration for AWS is available: :doc:`apache-airflow-providers-amazon:connections/aws`
 The selected connection for AWS can be indicated by the parameter ``aws_conn_id``.
+Information about configuration for Azure is available: :docs:`apache-airflow-providers-microsoft-azure/connections/azure`
+The selected connection for Azure can be indicated by the parameter ``azure_conn_id``.
 
 For parameter definition, take a look at
 :class:`~airflow.providers.google.cloud.operators.cloud_storage_transfer_service.CloudDataTransferServiceCreateJobOperator`.

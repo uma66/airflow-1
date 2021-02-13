@@ -97,6 +97,13 @@ class WasbHook(BaseHook):
                 account_url=f"https://{conn.login}.blob.core.windows.net/", credential=conn.password, **extra
             )
 
+    def get_sas_token(self) -> str:
+        """Return the SAS token."""
+        conn = self.get_connection(self.conn_id)
+        extra = conn.extra_dejson or {}
+        sas_token = extra.get('sas_token')
+        return sas_token
+
     def _get_container_client(self, container_name: str) -> ContainerClient:
         """
         Instantiates a container client
